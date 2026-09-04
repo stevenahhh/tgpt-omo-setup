@@ -93,7 +93,6 @@ Notes:
 
 ### Common model entry format
 
-All models use the same shape with `contextWindow` 1048576 (1M). Setting a large context window on the client side is safe — the server enforces the real per-model limit, and OMO's model-switch guard needs the headroom:
 ```json
 {
   "id": "google/gemini-3.8-flash",
@@ -106,19 +105,41 @@ All models use the same shape with `contextWindow` 1048576 (1M). Setting a large
 }
 ```
 
-### Recommended model list (curated to latest per family, verified by live bridge calls on 2026-09-03)
+**`contextWindow` correctness matters.** OMO uses this number for its model-switch guard and compaction timing, not just display. Set it too high and the agent believes it still has headroom long after the real upstream limit is gone, so every call starts failing with a 400 right when a long session needs the model most. Do not blanket-set 1M for every model — use the verified value below.
 
-Register exactly these 14 models — the latest per family, no `:batch` variants (batch requires the async Batch API and cannot be used by interactive agents):
+### Recommended model list with verified `contextWindow` (as of 2026-09-03)
 
-- GPT (5.6 series only): `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`, `openai/gpt-5.6-luna`
-- Claude (4.6+ only): `anthropic/claude-sonnet-4.6`, `anthropic/claude-opus-4.7`, `anthropic/claude-opus-4.8`, `anthropic/claude-sonnet-5`, `anthropic/claude-opus-5`, `anthropic/claude-fable-5`, `anthropic/claude-fable-5.1`
-- Gemini (3.8 only): `google/gemini-3.8-flash`
-- Grok (4.6 only): `x-ai/grok-4.6` (bare `grok-4.6` also resolves)
-- Kimi: `kimi-k3`, `moonshotai/kimi-k3` (absent from the public model list but confirmed working via authenticated calls)
+Register exactly these 14 models — the latest per family, no `:batch` variants (batch requires the async Batch API and cannot be used by interactive agents). The `contextWindow` column is either an empirically confirmed real limit (found by sending an oversized prompt and reading the upstream error message) or, where marked unverified, the vendor's advertised figure copied as a placeholder:
+
+| Family | Model id | `contextWindow` | Verified? |
+|---|---|---|---|
+| GPT | `openai/gpt-5.6-sol` | `1048576` | Yes — live probe at 900K passed, 1.1M failed with `"maximum context length is 1050000 tokens"`. `1048576 < 1050000`, safe margin. |
+| GPT | `openai/gpt-5.6-terra` | `1048576` | Yes, same probe result as gpt-5.6-sol. |
+| GPT | `openai/gpt-5.6-luna` | `1048576` | Yes, same probe result as gpt-5.6-sol. |
+| Kimi | `kimi-k3` | `262144` | Yes — live probe at ~450K failed with `"maximum context length is 262144 tokens"` (DeepInfra backend). Do NOT set this to 1M; it is a real regression, not a placeholder. |
+| Kimi | `moonshotai/kimi-k3` | `262144` | Same as `kimi-k3` (same backend). |
+| Claude | `anthropic/claude-sonnet-4.6` | `1048576` | **No** — not empirically probed. Anthropic's own docs advertise 1M for this tier; treat as a placeholder until tested. |
+| Claude | `anthropic/claude-opus-4.7` | `1048576` | No, same caveat. |
+| Claude | `anthropic/claude-opus-4.8` | `1048576` | No, same caveat. |
+| Claude | `anthropic/claude-sonnet-5` | `1048576` | No, same caveat. |
+| Claude | `anthropic/claude-opus-5` | `1048576` | No, same caveat. |
+| Claude | `anthropic/claude-fable-5` | `1048576` | No, same caveat. |
+| Claude | `anthropic/claude-fable-5.1` | `1048576` | No, same caveat. |
+| Gemini | `google/gemini-3.8-flash` | `1048576` | No, same caveat. |
+| Grok | `x-ai/grok-4.6` | `256000` | No — not probed; set conservatively below the GPT/Claude tier since xAI's public figure for this class is smaller. |
 
 Do NOT register older or mid-tier models (gpt-5.5 and below, claude-4.5 and below, gemini-3.7 and below, mistral, solar, llama, qwen) — they still answer on the bridge, but keeping the catalog to the frontier avoids silent quality regressions when an agent picks a model by name.
 
-Note: the list drifts. `curl -s https://hello.timelygpt.co.kr/api/v2/chat/bridge/info/models` shows the public list, but models missing from it can still work when called with authentication — a successful live call is the real criterion.
+Note: the model list itself drifts. `curl -s https://hello.timelygpt.co.kr/api/v2/chat/bridge/info/models` shows the public list, but models missing from it can still work when called with authentication — a successful live call is the real criterion.
+
+#### GATE 1 (optional, cost-blocking): empirically verifying an unverified `contextWindow`
+
+Confirming a real context limit requires sending a prompt large enough to approach or exceed it, which consumes real workspace credit proportional to input tokens (a single ~900K-token probe is not cheap; a full sweep across the unverified Claude/Gemini/Grok rows in the table above costs noticeably more). **Do not run this kind of probe on your own initiative.** If the user asks you to verify one of the "No" rows above:
+
+1. Tell the user up front, before sending anything, roughly how many large-prompt calls the verification needs (one binary-search style sweep per model is typically 2-4 calls).
+2. Only proceed after the user confirms.
+3. Method: send a prompt sized near the vendor's advertised limit; read the upstream error message on failure (it states the real limit directly, e.g. `"maximum context length is 262144 tokens"`), or confirm success under it. A needle-in-haystack prompt (place a unique fact in the middle of filler text, then ask for it back) additionally confirms the model can actually use the full window, not just accept the byte count.
+4. Update the table and `contextWindow` value only for the models actually tested; do not extrapolate one family's result onto another.
 
 ## Step 3: Register recommendation chains (`~/.omo/omo.jsonc`)
 
@@ -181,7 +202,7 @@ If the user requests a different priority, follow their instruction. Do not dele
 4. Failure handling by cause:
    - `not a valid model ID` -> model id typo; compare against the Step 2 list.
    - 401 / `Missing Authorization header` -> key missing or wrong; return to GATE 0.
-   - `cannot switch: target context window ...` -> the model's `contextWindow` is set smaller than actual; raise Gemini/Claude entries to 1048576.
+   - `cannot switch: target context window ...` -> the model's `contextWindow` is set smaller than actual. Check the table in Step 2 first: if the model has a verified real limit smaller than what the guard needs, that model genuinely cannot serve this session (compact the session instead of raising the number). Only raise `contextWindow` when the table marks the model unverified and you have separately confirmed the real limit is actually higher (see GATE 1).
    - Multi-minute stall at startup -> add the `--offline` flag (it is a startup-phase issue, not a model call issue).
    - `reasoning_effort` rejected with 400 -> that model/backend does not accept the parameter; set `"reasoning": false` for that model (see Step 4 item 3).
 

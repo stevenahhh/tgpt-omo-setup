@@ -93,7 +93,7 @@ Notes:
 
 ### Common model entry format
 
-Gemini/Claude families:
+All models use the same shape with `contextWindow` 1048576 (1M). Setting a large context window on the client side is safe — the server enforces the real per-model limit, and OMO's model-switch guard needs the headroom:
 ```json
 {
   "id": "google/gemini-3.8-flash",
@@ -106,14 +106,17 @@ Gemini/Claude families:
 }
 ```
 
-For GPT-family models use `contextWindow` 128000 (or omit to use the default), and 262144 for Kimi. Models with the `:batch` suffix must have `"reasoning": false`.
+### Recommended model list (curated to latest per family, verified by live bridge calls on 2026-09-03)
 
-### Verified model list (as of 2026-09-03, confirmed by live bridge calls)
+Register exactly these 14 models — the latest per family, no `:batch` variants (batch requires the async Batch API and cannot be used by interactive agents):
 
-- GPT: `openai/gpt-5.5`, `openai/gpt-5.5:batch`, `openai/gpt-5.5-pro`, `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`, `openai/gpt-5.6-luna`
-- Claude: `anthropic/claude-haiku-4.5` (+`:batch`), `anthropic/claude-sonnet-4.5`, `anthropic/claude-sonnet-4.6` (+`:batch`), `anthropic/claude-opus-4.7` (+`:batch`), `anthropic/claude-opus-4.8`, `anthropic/claude-sonnet-5`, `anthropic/claude-opus-5`, `anthropic/claude-fable-5`, `anthropic/claude-fable-5.1`
-- Gemini: `google/gemini-3.5-flash`, `google/gemini-3.5-flash-lite`, `google/gemini-3.6-flash`, `google/gemini-3.8-flash`
+- GPT (5.6 series only): `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`, `openai/gpt-5.6-luna`
+- Claude (4.6+ only): `anthropic/claude-sonnet-4.6`, `anthropic/claude-opus-4.7`, `anthropic/claude-opus-4.8`, `anthropic/claude-sonnet-5`, `anthropic/claude-opus-5`, `anthropic/claude-fable-5`, `anthropic/claude-fable-5.1`
+- Gemini (3.8 only): `google/gemini-3.8-flash`
+- Grok (4.6 only): `x-ai/grok-4.6` (bare `grok-4.6` also resolves)
 - Kimi: `kimi-k3`, `moonshotai/kimi-k3` (absent from the public model list but confirmed working via authenticated calls)
+
+Do NOT register older or mid-tier models (gpt-5.5 and below, claude-4.5 and below, gemini-3.7 and below, mistral, solar, llama, qwen) — they still answer on the bridge, but keeping the catalog to the frontier avoids silent quality regressions when an agent picks a model by name.
 
 Note: the list drifts. `curl -s https://hello.timelygpt.co.kr/api/v2/chat/bridge/info/models` shows the public list, but models missing from it can still work when called with authentication — a successful live call is the real criterion.
 
@@ -145,11 +148,42 @@ If the user requests a different priority, follow their instruction. Do not dele
      -p 'Reply with exactly SETUP_OK'
    ```
    On Windows PowerShell, replace the trailing backslash line-continuations with backticks or write the command on one line. Success = output contains `SETUP_OK` and exit code 0.
-3. Failure handling by cause:
+3. Per-model reasoning verification (mandatory after the basic live call passes):
+
+   The Timely bridge accepts the OpenAI-style `reasoning_effort` parameter (`low`/`medium`/`high`) and returns the reasoning trace in `message.reasoning` plus `usage.completion_tokens_details.reasoning_tokens`. Verify this per model family — do not assume all registered models support it.
+
+   For each model you registered, run this test (POSIX shell; on Windows use Python or `curl.exe` with double quotes):
+   ```sh
+   curl -s -X POST https://hello.timelygpt.co.kr/api/v2/chat/bridge/openai/chat/completions \
+     -H "Authorization: Bearer $TIMELYGPT_API_KEY" \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"MODEL_ID_HERE","messages":[{"role":"user","content":"What is 17*19? Think step by step."}],"max_tokens":200,"reasoning_effort":"high"}'
+   ```
+   Pass criteria per model:
+   - HTTP 200 (a 400 `not a valid model ID` means the id is wrong or the model was delisted — remove it from models.json)
+   - `usage.completion_tokens_details.reasoning_tokens` > 0
+   - `choices[0].message.reasoning` present and non-empty (some backends omit the field while still spending reasoning tokens; a token count > 0 alone is still acceptable support)
+
+   Minimum test matrix (one per family is enough if time-constrained, full matrix preferred):
+   | Family | Test model |
+   |---|---|
+   | GPT | `openai/gpt-5.6-sol` |
+   | Claude | `anthropic/claude-sonnet-5` |
+   | Gemini | `google/gemini-3.8-flash` |
+   | Kimi | `kimi-k3` |
+
+   If a model fails the reasoning check, set `"reasoning": false` and remove its `thinkingLevelMap`/`compat.supportsReasoningEffort` in models.json for that model only — do not disable reasoning globally. Then confirm OMO-level thinking works end to end:
+   ```sh
+   omo --offline --provider timely-scnu --model kimi-k3 --thinking high \
+     --no-model-fallback --no-recommended-models --no-session --no-tools \
+     -p 'What is 23*29? Show your reasoning.'
+   ```
+4. Failure handling by cause:
    - `not a valid model ID` -> model id typo; compare against the Step 2 list.
    - 401 / `Missing Authorization header` -> key missing or wrong; return to GATE 0.
    - `cannot switch: target context window ...` -> the model's `contextWindow` is set smaller than actual; raise Gemini/Claude entries to 1048576.
    - Multi-minute stall at startup -> add the `--offline` flag (it is a startup-phase issue, not a model call issue).
+   - `reasoning_effort` rejected with 400 -> that model/backend does not accept the parameter; set `"reasoning": false` for that model (see Step 4 item 3).
 
 ## Security notes
 

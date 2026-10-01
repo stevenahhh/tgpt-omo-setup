@@ -105,11 +105,28 @@ Notes:
 }
 ```
 
+### Claude entries: prompt caching must be enabled per model
+
+Every `anthropic/*` entry MUST carry `compat.cacheControlFormat = "anthropic"`. The bridge is OpenAI-compatible (`openai-completions`), and OMO sends Anthropic `cache_control` markers on that path only when this flag is set. Without it nothing is cached: the full prompt is re-read and re-billed on every turn (observed: `anthropic/claude-sonnet-5.5` showed `cacheRead = 0` on every turn at 120K-170K input tokens). Non-Claude models do not need the flag.
+
+```json
+{
+  "id": "anthropic/claude-sonnet-5.5",
+  "name": "anthropic/claude-sonnet-5.5 via Timely",
+  "contextWindow": 600000,
+  "reasoning": true,
+  "input": ["text"],
+  "compat": { "supportsReasoningEffort": true, "cacheControlFormat": "anthropic" }
+}
+```
+
+Repeat `supportsReasoningEffort` inside the model-level `compat`: it is not verified whether a model-level `compat` merges with or replaces the provider-level one, so stating both keys is safe either way. Verify with Step 4 item 4.
+
 **`contextWindow` correctness matters.** OMO uses this number for its model-switch guard and compaction timing, not just display. Set it too high and the agent believes it still has headroom long after the real upstream limit is gone, so every call starts failing with a 400 right when a long session needs the model most. Do not blanket-set 1M for every model — use the verified value below.
 
-### Recommended model list with verified `contextWindow` (as of 2026-09-03)
+### Recommended model list with verified `contextWindow` (as of 2026-09-03; `anthropic/claude-sonnet-5.5` added 2026-10-01)
 
-Register exactly these 14 models — the latest per family, no `:batch` variants (batch requires the async Batch API and cannot be used by interactive agents). The `contextWindow` column is either an empirically confirmed real limit (found by sending an oversized prompt and reading the upstream error message) or, where marked unverified, the vendor's advertised figure copied as a placeholder:
+Register exactly these 15 models — the latest per family, no `:batch` variants (batch requires the async Batch API and cannot be used by interactive agents). The `contextWindow` column is either an empirically confirmed real limit (found by sending an oversized prompt and reading the upstream error message) or, where marked unverified, the vendor's advertised figure copied as a placeholder:
 
 | Family | Model id | `contextWindow` | Verified? |
 |---|---|---|---|
@@ -125,6 +142,7 @@ Register exactly these 14 models — the latest per family, no `:batch` variants
 | Claude | `anthropic/claude-opus-5` | `1048576` | No, same caveat. |
 | Claude | `anthropic/claude-fable-5` | `1048576` | No, same caveat. |
 | Claude | `anthropic/claude-fable-5.1` | `1048576` | No, same caveat. |
+| Claude | `anthropic/claude-sonnet-5.5` | `600000` | No — owner-chosen cap, not probed. Raise it only after a GATE 1 probe. |
 | Gemini | `google/gemini-3.8-flash` | `1048576` | No, same caveat. |
 | Grok | `x-ai/grok-4.6` | `256000` | No — not probed; set conservatively below the GPT/Claude tier since xAI's public figure for this class is smaller. |
 
@@ -193,17 +211,32 @@ If the user requests a different priority, follow their instruction. Do not dele
    | Gemini | `google/gemini-3.8-flash` |
    | Kimi | `kimi-k3` |
 
+   For Claude models use a prompt that actually needs reasoning, not `17*19`: adaptive-thinking Claude models answer easy arithmetic without thinking, so `reasoning_tokens` is 0 even though reasoning works (`claude-sonnet-5` returned 0 on `17*19` and 1952 on a multi-step counting problem).
+
    If a model fails the reasoning check, set `"reasoning": false` and remove its `thinkingLevelMap`/`compat.supportsReasoningEffort` in models.json for that model only — do not disable reasoning globally. Then confirm OMO-level thinking works end to end:
    ```sh
    omo --offline --provider timely-scnu --model kimi-k3 --thinking high \
      --no-model-fallback --no-recommended-models --no-session --no-tools \
      -p 'What is 23*29? Show your reasoning.'
    ```
-4. Failure handling by cause:
+4. Claude prompt-cache verification (mandatory for every `anthropic/*` entry):
+
+   Send the same request twice with a `cache_control` marker on the system block, then read `usage.prompt_tokens_details`:
+   ```sh
+   curl -s -X POST https://hello.timelygpt.co.kr/api/v2/chat/bridge/openai/chat/completions \
+     -H "Authorization: Bearer $TIMELYGPT_API_KEY" \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"MODEL_ID_HERE","max_tokens":300,"messages":[{"role":"system","content":[{"type":"text","text":"UNIQUE_STAMP then several thousand tokens of real prose","cache_control":{"type":"ephemeral"}}]},{"role":"user","content":"Reply with the single word Okay."}]}'
+   ```
+   Pass = 1st call `cache_write_tokens` > 0, 2nd call `cached_tokens` > 0. Put a unique stamp at the start of the prefix so an earlier run's warm cache cannot fake a pass. Use real prose (for example the text of this manual) as the prefix: `claude-opus-5` and `claude-fable-5` answered repeated synthetic filler lines with `finish_reason: content_filter` and no usage fields, which looks like a cache failure but is a refusal. Verified 2026-10-01 on all eight Claude models in the table above.
+
+   This checks the bridge. To confirm OMO itself sends the markers, run a real session turn twice and confirm `cacheRead` > 0 from the second turn on; new `models.json` settings apply to a new session or after re-selecting the model.
+5. Failure handling by cause:
    - `not a valid model ID` -> model id typo; compare against the Step 2 list.
    - 401 / `Missing Authorization header` -> key missing or wrong; return to GATE 0.
    - `cannot switch: target context window ...` -> the model's `contextWindow` is set smaller than actual. Check the table in Step 2 first: if the model has a verified real limit smaller than what the guard needs, that model genuinely cannot serve this session (compact the session instead of raising the number). Only raise `contextWindow` when the table marks the model unverified and you have separately confirmed the real limit is actually higher (see GATE 1).
    - Multi-minute stall at startup -> add the `--offline` flag (it is a startup-phase issue, not a model call issue).
+   - Claude `cacheRead` stays 0 in real sessions while the curl test passes -> the model entry lacks `compat.cacheControlFormat = "anthropic"`, or the session predates the change (start a new one).
    - `reasoning_effort` rejected with 400 -> that model/backend does not accept the parameter; set `"reasoning": false` for that model (see Step 4 item 3).
 
 ## Security notes
